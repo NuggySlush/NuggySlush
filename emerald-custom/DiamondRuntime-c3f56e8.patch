@@ -36,7 +36,7 @@ index 727596a..419bee1 100644
 @@ -34,13 +36,7 @@ VulkanRendererContext::~VulkanRendererContext() {
      for (auto& [id, wt] : texMap) destroyWinTex(wt);
      texMap.clear();
-
+ 
 -    for (auto& wt : deleteQueue) {
 -        if (wt.ds   != VK_NULL_HANDLE) vk_.FreeDescriptorSets(device, winTexPool, 1, &wt.ds);
 -        if (wt.view != VK_NULL_HANDLE) vk_.DestroyImageView(device, wt.view, nullptr);
@@ -47,7 +47,7 @@ index 727596a..419bee1 100644
 +    for (auto& retired : deleteQueue) destroyTexNow(retired);
      deleteQueue.clear();
      cleanupSwapchain(); cleanupCursorTex();
-
+ 
 @@ -53,7 +49,6 @@ VulkanRendererContext::~VulkanRendererContext() {
      vk_.DestroyPipelineLayout(device, pipeLayout, nullptr);
      vk_.DestroyDescriptorSetLayout(device, dsLayout, nullptr);
@@ -92,11 +92,11 @@ index 727596a..419bee1 100644
 +        sem=created;
 +    }
  }
-
+ 
  void VulkanRendererContext::createRenderPass() {
 @@ -535,12 +545,12 @@ void VulkanRendererContext::createCmdBufs() {
  }
-
+ 
  void VulkanRendererContext::createSyncObjects() {
 -    imgAvailSems.resize(MAX_FRAMES_IN_FLIGHT); renderDoneSems.resize(MAX_FRAMES_IN_FLIGHT); inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
 +    // renderDoneSems are per swapchain image and live in createSwapchain().
@@ -135,7 +135,7 @@ index 727596a..419bee1 100644
  }
 @@ -955,15 +969,32 @@ void VulkanRendererContext::recordCmdBuf(VkCommandBuffer cb, uint32_t imgIdx,
  }
-
+ 
  void VulkanRendererContext::renderLoop() {
 -
      while (isRunning) {
@@ -170,7 +170,7 @@ index 727596a..419bee1 100644
 +        }
      }
  }
-
+ 
 @@ -972,14 +1003,20 @@ void VulkanRendererContext::flushDeleteQueue() {
      std::lock_guard<std::mutex> lk(renderMutex);
      if (deleteQueue.empty()) return;
@@ -197,15 +197,15 @@ index 727596a..419bee1 100644
 +    // Drop the reference updateWindowContentAHB() took, now that the GPU is done with it.
 +    if (retired.ahb) AHardwareBuffer_release(retired.ahb);
  }
-
+ 
  void VulkanRendererContext::renderFrame() {
 @@ -989,32 +1026,91 @@ void VulkanRendererContext::renderFrame() {
      cursorMoved.store(false,std::memory_order_relaxed);
-
+ 
      if (surfaceDetached.load(std::memory_order_acquire)) return;
 -    if (surfaceWidth==0||surfaceHeight==0) return;
 +    if (surfaceWidth==0||surfaceHeight==0) { swapchainRetryPending.store(true); return; }
-
+ 
      if (fbResized.load()) {
          for (auto& f:inFlightFences) vk_.WaitForFences(device,1,&f,VK_TRUE,UINT64_MAX);
 +        vk_.DeviceWaitIdle(device);
@@ -242,7 +242,7 @@ index 727596a..419bee1 100644
 +        }
          return;
      }
-
+ 
 -    if (currentFrame >= cmdBufs.size() || cmdBufs[currentFrame] == VK_NULL_HANDLE) return;
 +    if (swapchain==VK_NULL_HANDLE || cmdBufs.empty() ||
 +        currentFrame >= cmdBufs.size() || cmdBufs[currentFrame] == VK_NULL_HANDLE) {
@@ -277,7 +277,7 @@ index 727596a..419bee1 100644
 +        }
 +        retirePending.store(!deleteQueue.empty(),std::memory_order_release);
      }
-
+ 
      uint32_t imgIdx;
      VkResult res=vk_.AcquireNextImageKHR(device,swapchain,UINT64_MAX,imgAvailSems[currentFrame],VK_NULL_HANDLE,&imgIdx);
      if (res==VK_ERROR_OUT_OF_DATE_KHR||res==VK_ERROR_SURFACE_LOST_KHR){fbResized.store(true);return;}
@@ -298,11 +298,11 @@ index 727596a..419bee1 100644
 +        swapchainRetryPending.store(true);
          return;
      }
-
+ 
 @@ -1038,16 +1134,12 @@ ok=true;}catch(...){}
      {
          std::lock_guard<std::mutex> lk(renderMutex);
-
+ 
 -        if (!deleteQueue.empty()) {
 -            for (auto& wt:deleteQueue) {
 -                if (wt.ds  !=VK_NULL_HANDLE) vk_.FreeDescriptorSets(device,winTexPool,1,&wt.ds);
@@ -319,13 +319,13 @@ index 727596a..419bee1 100644
 +        // retires while we record and submit is kept until this frame's fence
 +        // has signalled.
 +        pendingFrameSerial=++submittedSerial;
-
+ 
          ox=sceneOffsetX; oy=sceneOffsetY; sx=sceneScaleX; sy=sceneScaleY;
          cw=(float)containerWidth; ch=(float)containerHeight;
 @@ -1093,7 +1185,9 @@ ok=true;}catch(...){}
          ox,oy,sx,sy,cw,ch,ptrX,ptrY,curHotX,curHotY,curW,curH,effectiveCurVis,
          effectiveScissor);
-
+ 
 -    VkSemaphore wSem[]={imgAvailSems[currentFrame]}, sSem[]={renderDoneSems[currentFrame]};
 +    // The present semaphore belongs to the swapchain image, not the frame slot:
 +    // the presentation engine may still wait on the previous one for a slot.
@@ -334,7 +334,7 @@ index 727596a..419bee1 100644
      VkSubmitInfo si{}; si.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;
      si.waitSemaphoreCount=1; si.pWaitSemaphores=wSem; si.pWaitDstStageMask=wStage;
 @@ -1102,11 +1196,25 @@ ok=true;}catch(...){}
-
+ 
      vk_.ResetFences(device,1,&inFlightFences[currentFrame]);
      if (vk_.QueueSubmit(graphicsQueue,1,&si,inFlightFences[currentFrame])!=VK_SUCCESS) {
 -        vk_.DestroyFence(device,inFlightFences[currentFrame],nullptr);
@@ -363,7 +363,7 @@ index 727596a..419bee1 100644
 @@ -1170,6 +1278,7 @@ bool VulkanRendererContext::reattachSurface(ANativeWindow* newWindow) {
          for (auto& [ahb, wt] : ahbImportCache)
              wt.needsTransition = true;
-
+ 
 +        swapchainRetryPending.store(false);
          surfaceDetached.store(false, std::memory_order_release);
      }
@@ -379,7 +379,7 @@ index 727596a..419bee1 100644
              if (wt.img!=VK_NULL_HANDLE) destroyWinTex(wt);
              if (!createWinTexResources(wt,w,h)) { texMap.erase(id); return; }
 @@ -1252,6 +1364,9 @@ void VulkanRendererContext::updateWindowContentAHB(int64_t id, AHardwareBuffer*
-
+ 
      WinTex& src = cit->second;
      WinTex& wt  = texMap[id];
 +    // Switching from CPU uploads to AHB: retire the window's own image and
@@ -416,13 +416,13 @@ index 237585b..fa6fd06 100644
 +        uint64_t serial = 0;
 +        AHardwareBuffer* ahb = nullptr;
 +    };
-
+ 
      struct RenderEntry { int64_t id; int x, y; };
      struct DrawEntry {
 @@ -228,7 +235,12 @@ private:
      std::unordered_map<AHardwareBuffer*, WinTex>              ahbImportCache;
      std::unordered_map<int64_t, std::vector<AHardwareBuffer*>> windowAhbs;
-
+ 
 -    std::vector<WinTex>    deleteQueue;
 +    std::vector<RetiredTex> deleteQueue;
 +    std::atomic<bool> retirePending{false};
@@ -431,7 +431,7 @@ index 237585b..fa6fd06 100644
 +    uint64_t pendingFrameSerial = 0; // serial being recorded/submitted, 0 if none
 +    uint64_t slotSerial[MAX_FRAMES_IN_FLIGHT] = {};
      std::vector<RenderEntry> renderList;
-
+ 
      std::vector<DrawEntry>             frameDraws;
 @@ -293,6 +305,7 @@ private:
      std::thread       renderThread;
@@ -463,7 +463,7 @@ index ec38f37..20f98d7 100644
  import dev.lcehub.emerald.core.DownloadProgressDialog;
 @@ -67,6 +68,7 @@ public class LauncherBridgeActivity extends AppCompatActivity {
          }
-
+ 
          if (container != null) {
 +            removeLegacyDxvkHud(container);
              updateDrives(container);
@@ -472,7 +472,7 @@ index ec38f37..20f98d7 100644
 @@ -231,6 +233,24 @@ public class LauncherBridgeActivity extends AppCompatActivity {
          });
      }
-
+ 
 +    // Containers created before the performance overlay was dropped from
 +    // Container.DEFAULT_ENV_VARS saved it in their env vars. Strip it once,
 +    // and only while it is still exactly the old default, so a HUD the user
@@ -495,10 +495,25 @@ index ec38f37..20f98d7 100644
          String drives = getDrivesString();
          if (!drives.equals(container.getDrives())) {
 diff --git a/app/app/src/main/java/dev/lcehub/emerald/XServerDisplayActivity.java b/app/app/src/main/java/dev/lcehub/emerald/XServerDisplayActivity.java
-index d2fa6e1..a990107 100644
+index d2fa6e1..b35e9c3 100644
 --- a/app/app/src/main/java/dev/lcehub/emerald/XServerDisplayActivity.java
 +++ b/app/app/src/main/java/dev/lcehub/emerald/XServerDisplayActivity.java
-@@ -938,6 +938,9 @@ public class XServerDisplayActivity extends AppCompatActivity {
+@@ -334,9 +334,11 @@ public class XServerDisplayActivity extends AppCompatActivity {
+             }
+         );
+ 
+-        boolean enableLogs =
+-            preferences.getBoolean("enable_wine_debug", false) ||
+-            preferences.getBoolean("enable_box64_logs", false);
++        // Always capture the game's output, so a launch that never draws a
++        // frame can be diagnosed from the side menu's Logs panel without
++        // changing settings. Verbose Wine/Box64 output still needs those
++        // switches; otherwise WINEDEBUG only lets errors through.
++        boolean enableLogs = true;
+ 
+         wireSidebarListeners(enableLogs);
+ 
+@@ -938,6 +940,9 @@ public class XServerDisplayActivity extends AppCompatActivity {
              environment.onResume();
          }
          startTime = System.currentTimeMillis();
@@ -508,6 +523,15 @@ index d2fa6e1..a990107 100644
          handler.postDelayed(savePlaytimeRunnable, SAVE_INTERVAL_MS);
          if (!isInPictureInPictureMode()) ProcessHelper.resumeAllWineProcesses();
      }
+@@ -1252,7 +1257,7 @@ public class XServerDisplayActivity extends AppCompatActivity {
+             "WINEDEBUG",
+             enableWineDebug && !wineDebugChannels.isEmpty()
+                 ? "+" + wineDebugChannels.replace(",", ",+")
+-                : "-all"
++                : "-all,err+all" // errors only: cheap, but shows why a game fails
+         );
+ 
+         String rootPath = imageFs.getRootDir().getPath();
 diff --git a/app/app/src/main/java/dev/lcehub/emerald/container/Container.java b/app/app/src/main/java/dev/lcehub/emerald/container/Container.java
 index 79d85fd..aab68cb 100644
 --- a/app/app/src/main/java/dev/lcehub/emerald/container/Container.java
@@ -521,6 +545,54 @@ index 79d85fd..aab68cb 100644
      public static final String DEFAULT_SCREEN_SIZE = "1280x720";
      public static final String DEFAULT_GRAPHICS_DRIVER = "wrapper";
      public static final String DEFAULT_AUDIO_DRIVER = "pulseaudio";
+diff --git a/app/app/src/main/java/dev/lcehub/emerald/contentdialog/DebugDialog.java b/app/app/src/main/java/dev/lcehub/emerald/contentdialog/DebugDialog.java
+index 0edf9ad..41ba64e 100644
+--- a/app/app/src/main/java/dev/lcehub/emerald/contentdialog/DebugDialog.java
++++ b/app/app/src/main/java/dev/lcehub/emerald/contentdialog/DebugDialog.java
+@@ -21,7 +21,8 @@ import java.io.IOException;
+ public class DebugDialog extends ContentDialog implements Callback<String> {
+     private final LogView logView;
+     private static boolean paused = false;
+-    private BufferedWriter writer;
++    // null when the log file cannot be written; the panel keeps working.
++    private volatile BufferedWriter writer;
+ 
+     public DebugDialog(@NonNull Context context) {
+         super(context, R.layout.debug_dialog);
+@@ -43,23 +44,28 @@ public class DebugDialog extends ContentDialog implements Callback<String> {
+             ((ImageButton)v).setImageResource(getPaused() ? R.drawable.icon_play : R.drawable.icon_pause);
+         });
+         llBottomBarPanel.addView(toolbarView);
++        // Logs are captured on every launch, so a missing storage permission
++        // or an unwritable folder must not crash the game: keep the in-app
++        // panel and skip the file instead.
+         try {
+             writer = new BufferedWriter(new FileWriter(logView.getLogFile(context)));
+         }
+-        catch (IOException e) {
+-            throw new RuntimeException(e);
++        catch (IOException | SecurityException e) {
++            writer = null;
+         }
+     }
+ 
+     @Override
+     public void call(final String line) {
+         if (!getPaused()) logView.append(line+"\n");
++        BufferedWriter w = writer;
++        if (w == null) return;
+         try {
+-            writer.write(line + "\n");
+-            writer.flush();
++            w.write(line + "\n");
++            w.flush();
+         }
+         catch (IOException e) {
+-            throw new RuntimeException(e);
++            writer = null;
+         }
+     }
+     
 diff --git a/app/app/src/main/java/dev/lcehub/emerald/core/EnvVars.java b/app/app/src/main/java/dev/lcehub/emerald/core/EnvVars.java
 index 8182b2a..73a4129 100644
 --- a/app/app/src/main/java/dev/lcehub/emerald/core/EnvVars.java
@@ -583,7 +655,7 @@ index beeaddc..7820c7e 100644
          }
          return filteredPids;
      }
-
+ 
 +    private static String readFirstLine(File file) {
 +        try (BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(file)))) {
 +            String line = br.readLine();
@@ -622,19 +694,19 @@ index b0bb1e7..fb2204e 100644
 +import android.net.Network;
  import android.os.Process;
  import android.util.Log;
-
+ 
 @@ -44,6 +46,7 @@ import java.nio.file.Path;
  import java.nio.file.Paths;
  import java.nio.file.StandardCopyOption;
  import java.util.ArrayList;
 +import java.util.List;
-
+ 
  public class GuestProgramLauncherComponent extends EnvironmentComponent {
      private String guestExecutable;
 @@ -328,11 +331,17 @@ public class GuestProgramLauncherComponent extends EnvironmentComponent {
-
+ 
          execEnvVars.put("ANDROID_SYSVSHM_SERVER", rootDir.getPath() + UnixSocketConfig.SYSVSHM_SERVER_PATH);
-
+ 
 +        // Use the active network's first resolver when Android reports one.
 +        // With a VPN or no network the link properties can be null or carry
 +        // no DNS servers at all, so fall back to Google's public resolver.

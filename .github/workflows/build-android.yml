@@ -62,9 +62,8 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git -C src/DiamondRuntime rev-parse HEAD)" = "$DIAMOND_COMMIT"
-          # The patches are stored without CRs and trailing blanks, while a few
-          # DiamondRuntime files use CRLF, so context lines are matched ignoring
-          # whitespace.
+          # The patches are exact git diffs (a few DiamondRuntime files use CRLF);
+          # --ignore-whitespace only relaxes how context lines are matched.
           git -C src/DiamondRuntime apply --ignore-whitespace --verbose "$GITHUB_WORKSPACE/custom/emerald-custom/DiamondRuntime-c3f56e8.patch"
           git -C src apply --ignore-whitespace --verbose "$GITHUB_WORKSPACE/custom/emerald-custom/LCE-Emerald-Launcher-b611c97.patch"
           git -C src status --short
