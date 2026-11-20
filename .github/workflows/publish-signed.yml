@@ -1,0 +1,84 @@
+# Publishes an APK that was re-signed with the release key outside CI.
+#
+# For each emerald-custom/signed/<tag>.env (intermediate pre-release, expected
+# hashes, signing certificate), splice_signature.py puts the matching
+# <tag>.sigblock - only the new APK Signing Block and the alignment padding
+# before it, never a key - into the intermediate APK. The result must match the
+# recorded SHA-256 byte for byte and verify with the recorded certificate before
+# it is released; the intermediate pre-release is then deleted.
+name: publish-signed
+
+on:
+  push:
+    branches: [claude/inspiring-carson-m0pzu3]
+    paths:
+      - ".github/workflows/publish-signed.yml"
+      - "emerald-custom/signed/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write # to publish the release and delete the intermediate one
+
+concurrency:
+  group: publish-signed
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: check out the signature blocks
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: set up the Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: install build-tools
+        run: sdkmanager --install "build-tools;36.0.0"
+
+      - name: publish the signed APKs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          shopt -s nullglob
+          for manifest in emerald-custom/signed/*.env; do
+            unset INTERMEDIATE_TAG INTERMEDIATE_ASSET INTERMEDIATE_SHA256 BUILD_RUN SIGBLOCK FINAL_TAG FINAL_ASSET FINAL_SHA256 CERT_SHA256
+            while IFS='=' read -r key value; do
+              case "$key" in
+                INTERMEDIATE_TAG|INTERMEDIATE_ASSET|INTERMEDIATE_SHA256|BUILD_RUN|SIGBLOCK|FINAL_TAG|FINAL_ASSET|FINAL_SHA256|CERT_SHA256)
+                  printf -v "$key" '%s' "$value" ;;
+              esac
+            done < "$manifest"
+            if gh release view "$FINAL_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+              echo "$FINAL_TAG is already published"
+              continue
+            fi
+            work=$(mktemp -d)
+            gh release download "$INTERMEDIATE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$INTERMEDIATE_ASSET" --dir "$work"
+            echo "$INTERMEDIATE_SHA256  $work/$INTERMEDIATE_ASSET" | sha256sum -c -
+            python3 emerald-custom/signed/splice_signature.py apply \
+              "$work/$INTERMEDIATE_ASSET" "emerald-custom/signed/$SIGBLOCK" "$work/$FINAL_ASSET"
+            echo "$FINAL_SHA256  $work/$FINAL_ASSET" | sha256sum -c -
+            "$BT/apksigner" verify --verbose --print-certs "$work/$FINAL_ASSET" | tee "$work/signature.txt"
+            grep -qx "Signer #1 certificate SHA-256 digest: $CERT_SHA256" "$work/signature.txt"
+            if [ -x "$BT/aapt" ]; then "$BT/aapt" dump badging "$work/$FINAL_ASSET" > "$work/badging.txt"; else "$BT/aapt2" dump badging "$work/$FINAL_ASSET" > "$work/badging.txt"; fi
+            grep -E "^(package|application-label|sdkVersion|targetSdkVersion|native-code):" "$work/badging.txt"
+            grep -q "^package: name='com.emerald.legacy.custom' " "$work/badging.txt"
+            grep -q "^application-label:'Emerald Custom'$" "$work/badging.txt"
+            {
+              printf 'Unofficial custom build of the LCE Emerald Launcher for Android.\n\n'
+              printf -- '- Package com.emerald.legacy.custom, label "Emerald Custom": installs next to the official app.\n'
+              printf -- '- Built by %s/%s/actions/runs/%s from the official sources plus the patches in emerald-custom/, then signed with the Emerald Custom release key.\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$BUILD_RUN"
+              printf -- '- APK SHA-256: %s\n' "$FINAL_SHA256"
+              printf -- '- Signing certificate SHA-256: %s\n' "$CERT_SHA256"
+            } > "$work/notes.md"
+            gh release create "$FINAL_TAG" "$work/$FINAL_ASSET" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "Emerald Custom ${FINAL_TAG#v}" --notes-file "$work/notes.md"
+            gh release delete "$INTERMEDIATE_TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+            rm -rf "$work"
+          done
