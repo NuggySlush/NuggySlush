@@ -16,7 +16,7 @@ on:
     branches: [claude/inspiring-carson-m0pzu3]
     paths:
       - ".github/workflows/build-android.yml"
-      - "emerald-custom/**"
+      - "emerald-custom/*.patch"
   workflow_dispatch:
     inputs:
       delete_tag:
