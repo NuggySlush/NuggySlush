@@ -1,0 +1,654 @@
+diff --git a/app/app/src/main/AndroidManifest.xml b/app/app/src/main/AndroidManifest.xml
+index c9ebfd4..f0d577f 100644
+--- a/app/app/src/main/AndroidManifest.xml
++++ b/app/app/src/main/AndroidManifest.xml
+@@ -131,7 +131,7 @@
+         <!-- FileProvider for sharing files -->
+         <provider
+             android:name="androidx.core.content.FileProvider"
+-            android:authorities="dev.lcehub.emerald.tileprovider"
++            android:authorities="${applicationId}.tileprovider"
+             android:exported="false"
+             android:grantUriPermissions="true">
+             <meta-data
+@@ -142,7 +142,7 @@
+         <!-- Provider for Winlator’s DocumentProvider or similar usage -->
+         <provider
+             android:name=".core.WinlatorFilesProvider"
+-            android:authorities="dev.lcehub.emerald.core.WinlatorFilesProvider"
++            android:authorities="${applicationId}.winlatorfiles"
+             android:exported="true"
+             android:grantUriPermissions="true"
+             android:permission="android.permission.MANAGE_DOCUMENTS">
+diff --git a/app/app/src/main/cpp/winlator/VulkanRendererContext.cpp b/app/app/src/main/cpp/winlator/VulkanRendererContext.cpp
+index 727596a..419bee1 100644
+--- a/app/app/src/main/cpp/winlator/VulkanRendererContext.cpp
++++ b/app/app/src/main/cpp/winlator/VulkanRendererContext.cpp
+@@ -5,6 +5,8 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <algorithm>
++#include <utility>
++#include <chrono>
+ #include <inttypes.h>
+ #include <dlfcn.h>
+ #include "window_vert.h"
+@@ -34,13 +36,7 @@ VulkanRendererContext::~VulkanRendererContext() {
+     for (auto& [id, wt] : texMap) destroyWinTex(wt);
+     texMap.clear();
+
+-    for (auto& wt : deleteQueue) {
+-        if (wt.ds   != VK_NULL_HANDLE) vk_.FreeDescriptorSets(device, winTexPool, 1, &wt.ds);
+-        if (wt.view != VK_NULL_HANDLE) vk_.DestroyImageView(device, wt.view, nullptr);
+-        if (wt.img  != VK_NULL_HANDLE) vk_.DestroyImage(device, wt.img, nullptr);
+-        if (wt.mem  != VK_NULL_HANDLE) vk_.FreeMemory(device, wt.mem, nullptr);
+-        if (wt.stg  != VK_NULL_HANDLE) { vk_.DestroyBuffer(device, wt.stg, nullptr); vk_.FreeMemory(device, wt.stgMem, nullptr); }
+-    }
++    for (auto& retired : deleteQueue) destroyTexNow(retired);
+     deleteQueue.clear();
+     cleanupSwapchain(); cleanupCursorTex();
+
+@@ -53,7 +49,6 @@ VulkanRendererContext::~VulkanRendererContext() {
+     vk_.DestroyPipelineLayout(device, pipeLayout, nullptr);
+     vk_.DestroyDescriptorSetLayout(device, dsLayout, nullptr);
+     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+-        vk_.DestroySemaphore(device, renderDoneSems[i], nullptr);
+         vk_.DestroySemaphore(device, imgAvailSems[i], nullptr);
+         vk_.DestroyFence(device, inFlightFences[i], nullptr);
+     }
+@@ -296,12 +291,17 @@ void VulkanRendererContext::createSwapchain() {
+     ci.imageSharingMode=VK_SHARING_MODE_EXCLUSIVE; ci.preTransform=pre;
+     ci.compositeAlpha=compositeAlpha; ci.presentMode=presentMode; ci.clipped=VK_TRUE;
+     ci.oldSwapchain=oldSwapchain;
+-    if (vk_.CreateSwapchainKHR(device,&ci,nullptr,&swapchain)!=VK_SUCCESS) throw std::runtime_error("swapchain");
+-    RLOG("swapchain created: %dx%d format=%d presentMode=%d compositeAlpha=%d imgCount=%u",
+-        swapchainExt.width,swapchainExt.height,(int)swapchainFmt,(int)presentMode,(int)compositeAlpha,imgCount);
++    // Only publish the handle on success, so a failed create never leaves a
++    // garbage swapchain behind for cleanupSwapchain() or the render loop.
++    VkSwapchainKHR newSwapchain=VK_NULL_HANDLE;
++    if (vk_.CreateSwapchainKHR(device,&ci,nullptr,&newSwapchain)!=VK_SUCCESS) throw std::runtime_error("swapchain");
++    swapchain=newSwapchain;
+     if (oldSwapchain!=VK_NULL_HANDLE) vk_.DestroySwapchainKHR(device,oldSwapchain,nullptr);
+     vk_.GetSwapchainImagesKHR(device,swapchain,&imgCount,nullptr);
+     swapchainImages.resize(imgCount); vk_.GetSwapchainImagesKHR(device,swapchain,&imgCount,swapchainImages.data());
++    swapchainImages.resize(imgCount);
++    RLOG("swapchain created: %dx%d format=%d presentMode=%d compositeAlpha=%d imgCount=%u",
++        swapchainExt.width,swapchainExt.height,(int)swapchainFmt,(int)presentMode,(int)compositeAlpha,imgCount);
+     swapchainViews.resize(imgCount);
+     for (size_t i=0;i<imgCount;i++) {
+         VkImageViewCreateInfo vi{}; vi.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+@@ -315,6 +315,16 @@ void VulkanRendererContext::createSwapchain() {
+         vi.components = mapping;
+         if (vk_.CreateImageView(device,&vi,nullptr,&swapchainViews[i])!=VK_SUCCESS) throw std::runtime_error("imgview");
+     }
++    // One render-done semaphore per swapchain image: the present engine may
++    // still be waiting on an image's semaphore when the next frame in flight
++    // starts, so it cannot be shared per frame slot.
++    renderDoneSems.resize(imgCount, VK_NULL_HANDLE);
++    VkSemaphoreCreateInfo si{}; si.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
++    for (auto& sem : renderDoneSems) {
++        VkSemaphore created=VK_NULL_HANDLE;
++        if (vk_.CreateSemaphore(device,&si,nullptr,&created)!=VK_SUCCESS) throw std::runtime_error("present semaphore");
++        sem=created;
++    }
+ }
+
+ void VulkanRendererContext::createRenderPass() {
+@@ -535,12 +545,12 @@ void VulkanRendererContext::createCmdBufs() {
+ }
+
+ void VulkanRendererContext::createSyncObjects() {
+-    imgAvailSems.resize(MAX_FRAMES_IN_FLIGHT); renderDoneSems.resize(MAX_FRAMES_IN_FLIGHT); inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
++    // renderDoneSems are per swapchain image and live in createSwapchain().
++    imgAvailSems.resize(MAX_FRAMES_IN_FLIGHT); inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
+     VkSemaphoreCreateInfo si{}; si.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+     VkFenceCreateInfo fi{}; fi.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO; fi.flags=VK_FENCE_CREATE_SIGNALED_BIT;
+     for (uint32_t i=0;i<MAX_FRAMES_IN_FLIGHT;i++) {
+         if (vk_.CreateSemaphore(device,&si,nullptr,&imgAvailSems[i])!=VK_SUCCESS||
+-            vk_.CreateSemaphore(device,&si,nullptr,&renderDoneSems[i])!=VK_SUCCESS||
+             vk_.CreateFence(device,&fi,nullptr,&inFlightFences[i])!=VK_SUCCESS) throw std::runtime_error("sync");
+     }
+ }
+@@ -548,6 +558,8 @@ void VulkanRendererContext::createSyncObjects() {
+ void VulkanRendererContext::cleanupSwapchain() {
+     for (auto fb:swapchainFBs) vk_.DestroyFramebuffer(device,fb,nullptr); swapchainFBs.clear();
+     for (auto iv:swapchainViews) vk_.DestroyImageView(device,iv,nullptr); swapchainViews.clear();
++    for (auto sem:renderDoneSems) if (sem!=VK_NULL_HANDLE) vk_.DestroySemaphore(device,sem,nullptr);
++    renderDoneSems.clear();
+     if (!cmdBufs.empty()){vk_.FreeCommandBuffers(device,cmdPool,(uint32_t)cmdBufs.size(),cmdBufs.data());cmdBufs.clear();}
+     if (swapchain!=VK_NULL_HANDLE) { vk_.DestroySwapchainKHR(device,swapchain,nullptr); swapchain=VK_NULL_HANDLE; }
+ }
+@@ -730,10 +742,12 @@ void VulkanRendererContext::destroyWinTex(WinTex& wt) {
+         return;
+     }
+     if (wt.img!=VK_NULL_HANDLE || wt.stg!=VK_NULL_HANDLE) {
+-
++        // A frame being recorded, or still in flight on the GPU, may reference
++        // this texture. Keep it until the newest such frame's fence signals.
+         WinTex deferred = wt;
+         deferred.isAHB = false;
+-        deleteQueue.push_back(deferred);
++        deleteQueue.push_back({deferred, pendingFrameSerial ? pendingFrameSerial : submittedSerial, nullptr});
++        retirePending.store(true, std::memory_order_release);
+     }
+     wt={};
+ }
+@@ -955,15 +969,32 @@ void VulkanRendererContext::recordCmdBuf(VkCommandBuffer cb, uint32_t imgIdx,
+ }
+
+ void VulkanRendererContext::renderLoop() {
+-
+     while (isRunning) {
+         { std::unique_lock<std::mutex> lk(dirtyMutex);
+           dirtyCV.wait(lk,[this]{
+-              return !isRunning||(!surfaceDetached.load()&&(needsRender.load()||fbResized.load()))||cursorMoved.load(); }); }
++              return !isRunning||(!surfaceDetached.load()&&
++                  (needsRender.load()||fbResized.load()||cursorMoved.load())); }); }
+         if (!isRunning) break;
+-
+-        if (swapchain == VK_NULL_HANDLE || cmdBufs.empty()) continue;
+-        try { renderFrame(); } catch(...) {}
++        // No early "continue" when the swapchain is missing: renderFrame()
++        // schedules the rebuild itself, and skipping it here spun this thread
++        // at 100% CPU because nothing ever cleared the wake-up flags.
++        try { renderFrame(); }
++        catch (const std::exception& e) {
++            if (!swapchainRetryPending.exchange(true)) RLOG_E("renderFrame failed: %s",e.what());
++            { std::lock_guard<std::mutex> lk(renderMutex); pendingFrameSerial=0; }
++            fbResized.store(true);
++        }
++        catch (...) {
++            if (!swapchainRetryPending.exchange(true)) RLOG_E("renderFrame failed: unknown exception");
++            { std::lock_guard<std::mutex> lk(renderMutex); pendingFrameSerial=0; }
++            fbResized.store(true);
++        }
++        // Back off between recovery attempts instead of retrying in a tight loop.
++        if (swapchainRetryPending.load()) {
++            std::unique_lock<std::mutex> lk(dirtyMutex);
++            dirtyCV.wait_for(lk,std::chrono::milliseconds(50),[this]{
++                return !isRunning||surfaceDetached.load(); });
++        }
+     }
+ }
+
+@@ -972,14 +1003,20 @@ void VulkanRendererContext::flushDeleteQueue() {
+     std::lock_guard<std::mutex> lk(renderMutex);
+     if (deleteQueue.empty()) return;
+     vk_.DeviceWaitIdle(device);
+-    for (auto& wt:deleteQueue) {
+-        if (wt.ds  !=VK_NULL_HANDLE) vk_.FreeDescriptorSets(device,winTexPool,1,&wt.ds);
+-        if (wt.view!=VK_NULL_HANDLE) vk_.DestroyImageView(device,wt.view,nullptr);
+-        if (wt.img !=VK_NULL_HANDLE) vk_.DestroyImage(device,wt.img,nullptr);
+-        if (wt.mem !=VK_NULL_HANDLE) vk_.FreeMemory(device,wt.mem,nullptr);
+-        if (wt.stg !=VK_NULL_HANDLE){vk_.DestroyBuffer(device,wt.stg,nullptr);vk_.FreeMemory(device,wt.stgMem,nullptr);}
+-    }
++    for (auto& retired:deleteQueue) destroyTexNow(retired);
+     deleteQueue.clear();
++    retirePending.store(false, std::memory_order_release);
++}
++
++void VulkanRendererContext::destroyTexNow(RetiredTex& retired) {
++    WinTex& wt=retired.wt;
++    if (wt.ds  !=VK_NULL_HANDLE) vk_.FreeDescriptorSets(device,winTexPool,1,&wt.ds);
++    if (wt.view!=VK_NULL_HANDLE) vk_.DestroyImageView(device,wt.view,nullptr);
++    if (wt.img !=VK_NULL_HANDLE) vk_.DestroyImage(device,wt.img,nullptr);
++    if (wt.mem !=VK_NULL_HANDLE) vk_.FreeMemory(device,wt.mem,nullptr);
++    if (wt.stg !=VK_NULL_HANDLE){vk_.DestroyBuffer(device,wt.stg,nullptr);vk_.FreeMemory(device,wt.stgMem,nullptr);}
++    // Drop the reference updateWindowContentAHB() took, now that the GPU is done with it.
++    if (retired.ahb) AHardwareBuffer_release(retired.ahb);
+ }
+
+ void VulkanRendererContext::renderFrame() {
+@@ -989,32 +1026,91 @@ void VulkanRendererContext::renderFrame() {
+     cursorMoved.store(false,std::memory_order_relaxed);
+
+     if (surfaceDetached.load(std::memory_order_acquire)) return;
+-    if (surfaceWidth==0||surfaceHeight==0) return;
++    if (surfaceWidth==0||surfaceHeight==0) { swapchainRetryPending.store(true); return; }
+
+     if (fbResized.load()) {
+         for (auto& f:inFlightFences) vk_.WaitForFences(device,1,&f,VK_TRUE,UINT64_MAX);
++        vk_.DeviceWaitIdle(device);
+         cleanupSwapchain();
++        // A successful acquire followed by a failed submit (or a throw while
++        // recording) leaves that acquire semaphore signaled with nothing
++        // waiting on it, so it must not be handed to vkAcquireNextImageKHR
++        // again. Recreate all acquire semaphores while the queue is idle.
++        VkSemaphoreCreateInfo semInfo{}; semInfo.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
++        for (auto& sem:imgAvailSems) {
++            if (sem!=VK_NULL_HANDLE) vk_.DestroySemaphore(device,sem,nullptr);
++            sem=VK_NULL_HANDLE;
++            VkSemaphore created=VK_NULL_HANDLE;
++            if (vk_.CreateSemaphore(device,&semInfo,nullptr,&created)!=VK_SUCCESS)
++                throw std::runtime_error("recreate acquire semaphore");
++            sem=created;
++        }
+         bool ok=false;
+-        try{createSwapchain();createFramebuffers();createCmdBufs();imgInFlight.assign(swapchainImages.size(),VK_NULL_HANDLE);
+-ok=true;}catch(...){}
+-        if (ok) fbResized.store(false);
++        try{createSwapchain();createFramebuffers();createCmdBufs();imgInFlight.assign(swapchainImages.size(),VK_NULL_HANDLE);ok=true;}
++        catch(const std::exception& e){
++            if (!swapchainRetryPending.exchange(true)) RLOG_E("swapchain recreate failed: %s",e.what());
++        }
++        catch(...){
++            if (!swapchainRetryPending.exchange(true)) RLOG_E("swapchain recreate failed: unknown exception");
++        }
++        if (ok) {
++            fbResized.store(false);
++            swapchainRetryPending.store(false);
++            needsRender.store(true);
++            dirtyCV.notify_one();
++        }
+         return;
+     }
+
+-    if (currentFrame >= cmdBufs.size() || cmdBufs[currentFrame] == VK_NULL_HANDLE) return;
++    if (swapchain==VK_NULL_HANDLE || cmdBufs.empty() ||
++        currentFrame >= cmdBufs.size() || cmdBufs[currentFrame] == VK_NULL_HANDLE) {
++        // Nothing to render into (e.g. an earlier recreate failed): schedule
++        // a rebuild and let renderLoop() back off before trying again.
++        fbResized.store(true);
++        swapchainRetryPending.store(true);
++        return;
++    }
+     bool currentFenceWaited = false;
+-    if (!vk_.GetFenceStatus || vk_.GetFenceStatus(device, inFlightFences[currentFrame]) == VK_NOT_READY) {
+-        vk_.WaitForFences(device,1,&inFlightFences[currentFrame],VK_TRUE,UINT64_MAX);
++    VkResult fenceState=vk_.GetFenceStatus ? vk_.GetFenceStatus(device,inFlightFences[currentFrame]) : VK_NOT_READY;
++    if (fenceState==VK_NOT_READY) {
++        if (vk_.WaitForFences(device,1,&inFlightFences[currentFrame],VK_TRUE,UINT64_MAX)!=VK_SUCCESS)
++            throw std::runtime_error("frame fence wait");
+         currentFenceWaited = true;
++    } else if (fenceState!=VK_SUCCESS) throw std::runtime_error("frame fence status");
++    // The previous frame on this slot has finished, and fence signals cover
++    // all earlier submissions on the queue, so every retired texture tagged
++    // with that serial or an older one is no longer referenced by the GPU.
++    completedSerial=std::max(completedSerial,slotSerial[currentFrame]);
++    if (retirePending.load(std::memory_order_acquire)) {
++        std::lock_guard<std::mutex> lk(renderMutex);
++        if (!deleteQueue.empty()) {
++            size_t keep=0;
++            for (auto& retired:deleteQueue) {
++                if (retired.serial<=completedSerial) destroyTexNow(retired);
++                else deleteQueue[keep++]=std::move(retired);
++            }
++            deleteQueue.resize(keep);
++        }
++        retirePending.store(!deleteQueue.empty(),std::memory_order_release);
+     }
+
+     uint32_t imgIdx;
+     VkResult res=vk_.AcquireNextImageKHR(device,swapchain,UINT64_MAX,imgAvailSems[currentFrame],VK_NULL_HANDLE,&imgIdx);
+     if (res==VK_ERROR_OUT_OF_DATE_KHR||res==VK_ERROR_SURFACE_LOST_KHR){fbResized.store(true);return;}
+-    if (res!=VK_SUCCESS&&res!=VK_SUBOPTIMAL_KHR) return;
++    if (res!=VK_SUCCESS&&res!=VK_SUBOPTIMAL_KHR) {
++        // Any other acquire failure: rebuild the swapchain and its acquire
++        // semaphores after a back-off instead of retrying the same state.
++        if (!swapchainRetryPending.exchange(true)) RLOG_E("renderFrame: vkAcquireNextImageKHR failed: %d",(int)res);
++        fbResized.store(true);
++        return;
++    }
+     if (imgIdx >= swapchainFBs.size() || imgIdx >= swapchainImages.size()) {
+         RLOG_E("renderFrame: invalid acquired image index=%u (fb=%zu images=%zu)",
+             imgIdx, swapchainFBs.size(), swapchainImages.size());
++        // The acquire semaphore will still be signaled for an image we cannot
++        // render; rebuild rather than reuse that semaphore.
++        fbResized.store(true);
++        swapchainRetryPending.store(true);
+         return;
+     }
+
+@@ -1038,16 +1134,12 @@ ok=true;}catch(...){}
+     {
+         std::lock_guard<std::mutex> lk(renderMutex);
+
+-        if (!deleteQueue.empty()) {
+-            for (auto& wt:deleteQueue) {
+-                if (wt.ds  !=VK_NULL_HANDLE) vk_.FreeDescriptorSets(device,winTexPool,1,&wt.ds);
+-                if (wt.view!=VK_NULL_HANDLE) vk_.DestroyImageView(device,wt.view,nullptr);
+-                if (wt.img !=VK_NULL_HANDLE) vk_.DestroyImage(device,wt.img,nullptr);
+-                if (wt.mem !=VK_NULL_HANDLE) vk_.FreeMemory(device,wt.mem,nullptr);
+-                if (wt.stg !=VK_NULL_HANDLE){vk_.DestroyBuffer(device,wt.stg,nullptr);vk_.FreeMemory(device,wt.stgMem,nullptr);}
+-            }
+-            deleteQueue.clear();
+-        }
++        // Do not free retired textures here: the other frame in flight may
++        // still be sampling them. Instead pin this frame's serial before the
++        // draw list is built, so anything removeWindow()/destroyWinTex()
++        // retires while we record and submit is kept until this frame's fence
++        // has signalled.
++        pendingFrameSerial=++submittedSerial;
+
+         ox=sceneOffsetX; oy=sceneOffsetY; sx=sceneScaleX; sy=sceneScaleY;
+         cw=(float)containerWidth; ch=(float)containerHeight;
+@@ -1093,7 +1185,9 @@ ok=true;}catch(...){}
+         ox,oy,sx,sy,cw,ch,ptrX,ptrY,curHotX,curHotY,curW,curH,effectiveCurVis,
+         effectiveScissor);
+
+-    VkSemaphore wSem[]={imgAvailSems[currentFrame]}, sSem[]={renderDoneSems[currentFrame]};
++    // The present semaphore belongs to the swapchain image, not the frame slot:
++    // the presentation engine may still wait on the previous one for a slot.
++    VkSemaphore wSem[]={imgAvailSems[currentFrame]}, sSem[]={renderDoneSems[imgIdx]};
+     VkPipelineStageFlags wStage[]={VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+     VkSubmitInfo si{}; si.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;
+     si.waitSemaphoreCount=1; si.pWaitSemaphores=wSem; si.pWaitDstStageMask=wStage;
+@@ -1102,11 +1196,25 @@ ok=true;}catch(...){}
+
+     vk_.ResetFences(device,1,&inFlightFences[currentFrame]);
+     if (vk_.QueueSubmit(graphicsQueue,1,&si,inFlightFences[currentFrame])!=VK_SUCCESS) {
+-        vk_.DestroyFence(device,inFlightFences[currentFrame],nullptr);
++        { std::lock_guard<std::mutex> lk(renderMutex); pendingFrameSerial=0; }
++        // Replace the fence (it was reset but never submitted) and forget it in
++        // imgInFlight, which would otherwise keep the destroyed handle.
++        VkFence deadFence=inFlightFences[currentFrame];
++        for (auto& f:imgInFlight) if (f==deadFence) f=VK_NULL_HANDLE;
++        vk_.DestroyFence(device,deadFence,nullptr);
+         VkFenceCreateInfo fi{}; fi.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO; fi.flags=VK_FENCE_CREATE_SIGNALED_BIT;
+         vk_.CreateFence(device,&fi,nullptr,&inFlightFences[currentFrame]);
++        // The acquired image is never presented and its acquire semaphore stays
++        // signaled: rebuild the swapchain (and acquire semaphores) after a back-off.
++        if (!swapchainRetryPending.exchange(true)) RLOG_E("renderFrame: vkQueueSubmit failed");
++        fbResized.store(true);
+         return;
+     }
++    {
++        std::lock_guard<std::mutex> lk(renderMutex);
++        slotSerial[currentFrame]=pendingFrameSerial;
++        pendingFrameSerial=0;
++    }
+     VkSwapchainKHR scs[]={swapchain};
+     VkPresentInfoKHR pi{}; pi.sType=VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+     pi.waitSemaphoreCount=1; pi.pWaitSemaphores=sSem; pi.swapchainCount=1; pi.pSwapchains=scs; pi.pImageIndices=&imgIdx;
+@@ -1170,6 +1278,7 @@ bool VulkanRendererContext::reattachSurface(ANativeWindow* newWindow) {
+         for (auto& [ahb, wt] : ahbImportCache)
+             wt.needsTransition = true;
+
++        swapchainRetryPending.store(false);
+         surfaceDetached.store(false, std::memory_order_release);
+     }
+     needsRender.store(true, std::memory_order_release);
+@@ -1208,6 +1317,9 @@ void VulkanRendererContext::updateWindowContent(int64_t id, void* px, short w, s
+     {
+         std::lock_guard<std::mutex> lk(renderMutex);
+         WinTex& wt=texMap[id];
++        // An AHB-borrowed entry points at the import cache's image, which the
++        // cache owns: forget it so this window gets its own CPU resources.
++        if (wt.isAHB) wt={};
+         if (wt.img==VK_NULL_HANDLE || wt.w!=w || wt.h!=h) {
+             if (wt.img!=VK_NULL_HANDLE) destroyWinTex(wt);
+             if (!createWinTexResources(wt,w,h)) { texMap.erase(id); return; }
+@@ -1252,6 +1364,9 @@ void VulkanRendererContext::updateWindowContentAHB(int64_t id, AHardwareBuffer*
+
+     WinTex& src = cit->second;
+     WinTex& wt  = texMap[id];
++    // Switching from CPU uploads to AHB: retire the window's own image and
++    // staging buffer first instead of overwriting (and leaking) them.
++    if (!wt.isAHB) destroyWinTex(wt);
+     wt.img  = src.img;
+     wt.mem  = src.mem;
+     wt.view = src.view;
+@@ -1292,8 +1407,10 @@ void VulkanRendererContext::removeWindow(int64_t id) {
+             if (cit != ahbImportCache.end()) {
+                 WinTex deferred = cit->second;
+                 deferred.isAHB  = false;
+-                deleteQueue.push_back(deferred);
+-                AHardwareBuffer_release(ahb);
++                // Keep the import and our AHB reference until no frame in
++                // flight can still sample it; destroyTexNow() releases both.
++                deleteQueue.push_back({deferred, pendingFrameSerial ? pendingFrameSerial : submittedSerial, ahb});
++                retirePending.store(true, std::memory_order_release);
+                 ahbImportCache.erase(cit);
+             }
+         }
+diff --git a/app/app/src/main/cpp/winlator/VulkanRendererContext.h b/app/app/src/main/cpp/winlator/VulkanRendererContext.h
+index 237585b..fa6fd06 100644
+--- a/app/app/src/main/cpp/winlator/VulkanRendererContext.h
++++ b/app/app/src/main/cpp/winlator/VulkanRendererContext.h
+@@ -196,6 +196,13 @@ private:
+         bool                 needsTransition = false;
+         AHardwareBuffer*     ahb            = nullptr;
+     };
++    // A texture (and, for AHB imports, the buffer reference) that frames up to
++    // `serial` may still read; freed once that frame's fence has signalled.
++    struct RetiredTex {
++        WinTex wt;
++        uint64_t serial = 0;
++        AHardwareBuffer* ahb = nullptr;
++    };
+
+     struct RenderEntry { int64_t id; int x, y; };
+     struct DrawEntry {
+@@ -228,7 +235,12 @@ private:
+     std::unordered_map<AHardwareBuffer*, WinTex>              ahbImportCache;
+     std::unordered_map<int64_t, std::vector<AHardwareBuffer*>> windowAhbs;
+
+-    std::vector<WinTex>    deleteQueue;
++    std::vector<RetiredTex> deleteQueue;
++    std::atomic<bool> retirePending{false};
++    uint64_t submittedSerial = 0;    // last frame serial pinned for recording
++    uint64_t completedSerial = 0;    // highest serial whose fence has signalled
++    uint64_t pendingFrameSerial = 0; // serial being recorded/submitted, 0 if none
++    uint64_t slotSerial[MAX_FRAMES_IN_FLIGHT] = {};
+     std::vector<RenderEntry> renderList;
+
+     std::vector<DrawEntry>             frameDraws;
+@@ -293,6 +305,7 @@ private:
+     std::thread       renderThread;
+     std::atomic<bool> isRunning{false};
+     std::atomic<bool> fbResized{false};
++    std::atomic<bool> swapchainRetryPending{false};
+     std::mutex        renderMutex;
+     std::mutex        dirtyMutex;
+     std::condition_variable dirtyCV;
+@@ -326,6 +339,7 @@ private:
+     bool  importAHBToWinTex(WinTex& wt, AHardwareBuffer* ahb);
+     void  cleanupAllAHBCache();
+     void  flushDeleteQueue();
++    void  destroyTexNow(RetiredTex& retired);
+     void  destroyWinTex(WinTex& wt);
+     void  ensureCursorTex(short w, short h);
+     void  cleanupCursorTex();
+diff --git a/app/app/src/main/java/dev/lcehub/emerald/LauncherBridgeActivity.java b/app/app/src/main/java/dev/lcehub/emerald/LauncherBridgeActivity.java
+index ec38f37..20f98d7 100644
+--- a/app/app/src/main/java/dev/lcehub/emerald/LauncherBridgeActivity.java
++++ b/app/app/src/main/java/dev/lcehub/emerald/LauncherBridgeActivity.java
+@@ -9,6 +9,7 @@ import dev.lcehub.emerald.container.ContainerManager;
+ import dev.lcehub.emerald.contents.ContentsManager;
+ import dev.lcehub.emerald.core.AppUtils;
+ import dev.lcehub.emerald.core.DefaultVersion;
++import dev.lcehub.emerald.core.EnvVars;
+ import dev.lcehub.emerald.core.WineInfo;
+ import dev.lcehub.emerald.xenvironment.ImageFsInstaller;
+ import dev.lcehub.emerald.core.DownloadProgressDialog;
+@@ -67,6 +68,7 @@ public class LauncherBridgeActivity extends AppCompatActivity {
+         }
+
+         if (container != null) {
++            removeLegacyDxvkHud(container);
+             updateDrives(container);
+             onContainerReady(container);
+             return;
+@@ -231,6 +233,24 @@ public class LauncherBridgeActivity extends AppCompatActivity {
+         });
+     }
+
++    // Containers created before the performance overlay was dropped from
++    // Container.DEFAULT_ENV_VARS saved it in their env vars. Strip it once,
++    // and only while it is still exactly the old default, so a HUD the user
++    // configured (or turns back on later) is left alone.
++    private static final String LEGACY_DXVK_HUD = "devinfo,version,gpuload,fps";
++    private static final String EXTRA_LEGACY_DXVK_HUD_REMOVED = "legacyDxvkHudRemoved";
++
++    private void removeLegacyDxvkHud(Container container) {
++        if ("1".equals(container.getExtra(EXTRA_LEGACY_DXVK_HUD_REMOVED))) return;
++        EnvVars envVars = new EnvVars(container.getEnvVars());
++        if (LEGACY_DXVK_HUD.equals(envVars.get("DXVK_HUD"))) {
++            envVars.remove("DXVK_HUD");
++            container.setEnvVars(envVars.toString());
++        }
++        container.putExtra(EXTRA_LEGACY_DXVK_HUD_REMOVED, "1");
++        container.saveData();
++    }
++
+     private void updateDrives(Container container) {
+         String drives = getDrivesString();
+         if (!drives.equals(container.getDrives())) {
+diff --git a/app/app/src/main/java/dev/lcehub/emerald/XServerDisplayActivity.java b/app/app/src/main/java/dev/lcehub/emerald/XServerDisplayActivity.java
+index d2fa6e1..a990107 100644
+--- a/app/app/src/main/java/dev/lcehub/emerald/XServerDisplayActivity.java
++++ b/app/app/src/main/java/dev/lcehub/emerald/XServerDisplayActivity.java
+@@ -938,6 +938,9 @@ public class XServerDisplayActivity extends AppCompatActivity {
+             environment.onResume();
+         }
+         startTime = System.currentTimeMillis();
++        // onCreate() already posted the runnable; drop any pending copy first so
++        // every resume does not start another self-reposting playtime timer.
++        handler.removeCallbacks(savePlaytimeRunnable);
+         handler.postDelayed(savePlaytimeRunnable, SAVE_INTERVAL_MS);
+         if (!isInPictureInPictureMode()) ProcessHelper.resumeAllWineProcesses();
+     }
+diff --git a/app/app/src/main/java/dev/lcehub/emerald/container/Container.java b/app/app/src/main/java/dev/lcehub/emerald/container/Container.java
+index 79d85fd..aab68cb 100644
+--- a/app/app/src/main/java/dev/lcehub/emerald/container/Container.java
++++ b/app/app/src/main/java/dev/lcehub/emerald/container/Container.java
+@@ -25,7 +25,7 @@ public class Container {
+         BUTTON_A, BUTTON_B, BUTTON_X, BUTTON_Y, BUTTON_GRIP, BUTTON_TRIGGER,
+         THUMBSTICK_UP, THUMBSTICK_DOWN, THUMBSTICK_LEFT, THUMBSTICK_RIGHT
+     }
+-    public static final String DEFAULT_ENV_VARS = "WRAPPER_MAX_IMAGE_COUNT=0 VKD3D_SHADER_MODEL=6_6 ZINK_DESCRIPTORS=lazy ZINK_DEBUG=compact MESA_SHADER_CACHE_DISABLE=false MESA_SHADER_CACHE_MAX_SIZE=512MB mesa_glthread=true WINEESYNC=1 TU_DEBUG=noconform,sysmem DXVK_HUD=devinfo,version,gpuload,fps DXVK_DISABLE_TIMELINE_SEMAPHORES=1";
++    public static final String DEFAULT_ENV_VARS = "WRAPPER_MAX_IMAGE_COUNT=0 VKD3D_SHADER_MODEL=6_6 ZINK_DESCRIPTORS=lazy ZINK_DEBUG=compact MESA_SHADER_CACHE_DISABLE=false MESA_SHADER_CACHE_MAX_SIZE=512MB mesa_glthread=true WINEESYNC=1 TU_DEBUG=noconform,sysmem DXVK_DISABLE_TIMELINE_SEMAPHORES=1";
+     public static final String DEFAULT_SCREEN_SIZE = "1280x720";
+     public static final String DEFAULT_GRAPHICS_DRIVER = "wrapper";
+     public static final String DEFAULT_AUDIO_DRIVER = "pulseaudio";
+diff --git a/app/app/src/main/java/dev/lcehub/emerald/core/EnvVars.java b/app/app/src/main/java/dev/lcehub/emerald/core/EnvVars.java
+index 8182b2a..73a4129 100644
+--- a/app/app/src/main/java/dev/lcehub/emerald/core/EnvVars.java
++++ b/app/app/src/main/java/dev/lcehub/emerald/core/EnvVars.java
+@@ -23,6 +23,8 @@ public class EnvVars implements Iterable<String> {
+         String[] parts = values.split(" ");
+         for (String part : parts) {
+             int index = part.indexOf("=");
++            // A double space yields an empty token; skip anything that is not NAME=VALUE.
++            if (index < 0) continue;
+             String name = part.substring(0, index);
+             String value = part.substring(index+1);
+             data.put(name, value);
+diff --git a/app/app/src/main/java/dev/lcehub/emerald/core/ProcessHelper.java b/app/app/src/main/java/dev/lcehub/emerald/core/ProcessHelper.java
+index beeaddc..7820c7e 100644
+--- a/app/app/src/main/java/dev/lcehub/emerald/core/ProcessHelper.java
++++ b/app/app/src/main/java/dev/lcehub/emerald/core/ProcessHelper.java
+@@ -259,31 +259,56 @@ public abstract class ProcessHelper {
+     public static ArrayList<String> listRunningWineProcesses(){
+         File proc = new File("/proc");
+         String[] filters = {"wine", "exe"};
+-        String[] allPids;
+         ArrayList<String> filteredPids = new ArrayList<String>();
+-        List<String> filterList = Arrays.asList(filters);
+-        allPids = proc.list(new FilenameFilter(){
++        String[] allPids = proc.list(new FilenameFilter(){
+             public boolean accept(File proc, String filename){
+                 return new File(proc, filename).isDirectory() && filename.matches("[0-9]+");
+             }
+         });
+-
+-        for (int index = 0; index < allPids.length; index++){
+-            String data = "";
+-            try {
+-                FileInputStream fr = new FileInputStream(proc + "/" + allPids[index] + "/stat");
+-                BufferedReader br = new BufferedReader(new InputStreamReader(fr));
+-                data = br.readLine();
+-            }
+-            catch (IOException e) {}
+-            for (String filter : filterList) {
+-                if (data.contains(filter))
+-                    filteredPids.add(allPids[index]);
++        if (allPids == null) return filteredPids;
++
++        // Never report our own process: the callers stop, resume and kill
++        // everything listed here, and wait for the list to become empty.
++        String selfPid = String.valueOf(Process.myPid());
++        for (String pid : allPids) {
++            if (pid.equals(selfPid)) continue;
++            // stat only carries the kernel's process name, cut to 15 characters
++            // ("Minecraft.Clien"), so also match the full command line.
++            String stat = readFirstLine(new File(proc, pid + "/stat"));
++            String cmdline = readCmdline(new File(proc, pid + "/cmdline"));
++            for (String filter : filters) {
++                if (stat.contains(filter) || cmdline.contains(filter)) {
++                    filteredPids.add(pid);
++                    break;
++                }
+             }
+         }
+         return filteredPids;
+     }
+
++    private static String readFirstLine(File file) {
++        try (BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(file)))) {
++            String line = br.readLine();
++            return line != null ? line : "";
++        }
++        catch (IOException e) {
++            return ""; // the process exited while we were looking
++        }
++    }
++
++    private static String readCmdline(File file) {
++        // NUL-separated argv; empty for kernel threads and zombies.
++        try (InputStream in = new FileInputStream(file)) {
++            byte[] buf = new byte[4096];
++            int len = 0, n;
++            while (len < buf.length && (n = in.read(buf, len, buf.length - len)) > 0) len += n;
++            return new String(buf, 0, len).replace('\0', ' ');
++        }
++        catch (IOException e) {
++            return "";
++        }
++    }
++
+     public static int getProcessAffinityMask(int pid) {
+         try (BufferedReader br = new BufferedReader(
+                 new InputStreamReader(new FileInputStream("/proc/" + pid + "/status")))) {
+diff --git a/app/app/src/main/java/dev/lcehub/emerald/xenvironment/components/GuestProgramLauncherComponent.java b/app/app/src/main/java/dev/lcehub/emerald/xenvironment/components/GuestProgramLauncherComponent.java
+index b0bb1e7..fb2204e 100644
+--- a/app/app/src/main/java/dev/lcehub/emerald/xenvironment/components/GuestProgramLauncherComponent.java
++++ b/app/app/src/main/java/dev/lcehub/emerald/xenvironment/components/GuestProgramLauncherComponent.java
+@@ -5,6 +5,8 @@ import android.content.Context;
+ import android.content.SharedPreferences;
+ import android.content.pm.ApplicationInfo;
+ import android.net.ConnectivityManager;
++import android.net.LinkProperties;
++import android.net.Network;
+ import android.os.Process;
+ import android.util.Log;
+
+@@ -44,6 +46,7 @@ import java.nio.file.Path;
+ import java.nio.file.Paths;
+ import java.nio.file.StandardCopyOption;
+ import java.util.ArrayList;
++import java.util.List;
+
+ public class GuestProgramLauncherComponent extends EnvironmentComponent {
+     private String guestExecutable;
+@@ -328,11 +331,17 @@ public class GuestProgramLauncherComponent extends EnvironmentComponent {
+
+         execEnvVars.put("ANDROID_SYSVSHM_SERVER", rootDir.getPath() + UnixSocketConfig.SYSVSHM_SERVER_PATH);
+
++        // Use the active network's first resolver when Android reports one.
++        // With a VPN or no network the link properties can be null or carry
++        // no DNS servers at all, so fall back to Google's public resolver.
+         String primaryDNS = "8.8.4.4";
+         ConnectivityManager connectivityManager = (ConnectivityManager) context.getSystemService(Service.CONNECTIVITY_SERVICE);
+-        if (connectivityManager.getActiveNetwork() != null) {
+-            ArrayList<InetAddress> dnsServers = new ArrayList<>(connectivityManager.getLinkProperties(connectivityManager.getActiveNetwork()).getDnsServers());
+-            primaryDNS = dnsServers.get(0).toString().substring(1);
++        Network activeNetwork = connectivityManager != null ? connectivityManager.getActiveNetwork() : null;
++        LinkProperties linkProperties = activeNetwork != null ? connectivityManager.getLinkProperties(activeNetwork) : null;
++        List<InetAddress> dnsServers = linkProperties != null ? linkProperties.getDnsServers() : null;
++        if (dnsServers != null && !dnsServers.isEmpty() && dnsServers.get(0) != null) {
++            String address = dnsServers.get(0).getHostAddress();
++            if (address != null && !address.isEmpty()) primaryDNS = address;
+         }
+         execEnvVars.put("ANDROID_RESOLV_DNS", primaryDNS);
+         execEnvVars.put("WINE_NEW_NDIS", "1");

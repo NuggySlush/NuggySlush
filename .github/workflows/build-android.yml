@@ -1,0 +1,236 @@
+# Builds the "Emerald Custom" Android APK: the official LCE Emerald Launcher
+# and DiamondRuntime sources at the commits the patches were made against,
+# plus emerald-custom/*.patch, built the same way as upstream's build-android
+# job, then published as a GitHub release.
+#
+# Signing: if the repository secrets ANDROID_KEYSTORE_BASE64,
+# ANDROID_KEYSTORE_PASSWORD and ANDROID_KEY_ALIAS exist, the APK is signed
+# with that key and published as a normal release. Without them it is signed
+# with a throwaway key and published as an "intermediate" pre-release, to be
+# re-signed with the release key outside CI; run this workflow manually with
+# delete_tag set to remove such a pre-release afterwards.
+name: build-android
+
+on:
+  push:
+    branches: [claude/inspiring-carson-m0pzu3]
+    paths:
+      - ".github/workflows/build-android.yml"
+      - "emerald-custom/**"
+  workflow_dispatch:
+    inputs:
+      delete_tag:
+        description: "Instead of building, delete this intermediate pre-release (tag ending in -intermediate)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write # to publish (and delete) releases
+
+concurrency:
+  group: build-android-${{ inputs.delete_tag || 'build' }}
+  cancel-in-progress: false
+
+env:
+  LAUNCHER_REPO: LCE-Hub/LCE-Emerald-Launcher
+  LAUNCHER_COMMIT: b611c97aeef376f9c19f8ab62f9b24c9285809be
+  DIAMOND_COMMIT: c3f56e880c4c59fe591fa2bf863ea6f247886749
+  NDK_VERSION: 28.2.13676358
+
+jobs:
+  build-android:
+    if: ${{ !inputs.delete_tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - name: check out the patches
+        uses: actions/checkout@v4
+        with:
+          path: custom
+          persist-credentials: false
+
+      - name: check out the official sources at the patched commits
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LAUNCHER_REPO }}
+          ref: ${{ env.LAUNCHER_COMMIT }}
+          path: src
+          submodules: recursive
+          persist-credentials: false
+
+      - name: apply the patches
+        run: |
+          set -euo pipefail
+          test "$(git -C src/DiamondRuntime rev-parse HEAD)" = "$DIAMOND_COMMIT"
+          # The patches are stored without CRs and trailing blanks, while a few
+          # DiamondRuntime files use CRLF, so context lines are matched ignoring
+          # whitespace.
+          git -C src/DiamondRuntime apply --ignore-whitespace --verbose "$GITHUB_WORKSPACE/custom/emerald-custom/DiamondRuntime-c3f56e8.patch"
+          git -C src apply --ignore-whitespace --verbose "$GITHUB_WORKSPACE/custom/emerald-custom/LCE-Emerald-Launcher-b611c97.patch"
+          git -C src status --short
+
+      - name: install mingw and glslang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 glslang-tools
+
+      - name: set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          package_json_file: src/package.json
+
+      - name: set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: pnpm
+          cache-dependency-path: src/pnpm-lock.yaml
+
+      - name: set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: set up the Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: install Android SDK components
+        run: |
+          # The first three are what upstream installs; DiamondRuntime itself
+          # compiles against API 34 with build-tools 35, NDK 29 and CMake.
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "ndk;${NDK_VERSION}" \
+            "platforms;android-34" "build-tools;35.0.0" "ndk;29.0.14206865" "cmake;3.22.1"
+          (yes || true) | sdkmanager --licenses > /dev/null
+
+      - name: install Rust with the Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: cache Rust builds
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src/src-tauri -> target"
+
+      - name: install frontend dependencies
+        working-directory: src
+        run: pnpm install --frozen-lockfile
+
+      - name: build GoldMapper
+        working-directory: src
+        run: pnpm goldmapper
+
+      - name: download the bundled Android assets
+        working-directory: src
+        run: pnpm android:assets
+
+      - name: restore the Gradle wrapper jar
+        working-directory: src
+        run: |
+          VER=$(sed -n 's/.*gradle-\([0-9][0-9.]*\)-bin\.zip.*/\1/p' src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties)
+          curl -fL -o src-tauri/gen/android/gradle/wrapper/gradle-wrapper.jar \
+            "https://raw.githubusercontent.com/gradle/gradle/v${VER}/gradle/wrapper/gradle-wrapper.jar"
+
+      - name: set up signing
+        working-directory: src/src-tauri/gen/android/app
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > release.keystore
+            PASS="$ANDROID_KEYSTORE_PASSWORD"
+            ALIAS="$ANDROID_KEY_ALIAS"
+            echo "KEY_SOURCE=secrets" >> "$GITHUB_ENV"
+          else
+            # No release key in this repository: sign with a throwaway key so
+            # the release build type can run. Nothing about this key is kept.
+            PASS=$(openssl rand -hex 24)
+            ALIAS=throwaway
+            keytool -genkeypair -keystore release.keystore -storetype PKCS12 -alias "$ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 2 -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=Emerald Custom intermediate build (throwaway key)" -noprompt
+            echo "KEY_SOURCE=throwaway" >> "$GITHUB_ENV"
+          fi
+          printf 'keyAlias=%s\nkeyPassword=%s\nstoreFile=release.keystore\nstorePassword=%s\n' \
+            "$ALIAS" "$PASS" "$PASS" > key.properties
+
+      - name: build the APK
+        working-directory: src
+        run: |
+          export NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION" ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
+          npx tauri android build --target aarch64
+
+      - name: check the package, label and signature
+        id: check
+        working-directory: src/src-tauri/gen/android/app/build/outputs/apk/universal/release
+        run: |
+          set -euo pipefail
+          ls -la
+          APK=""
+          for f in *.apk; do case "$f" in *-unsigned*) ;; *) APK=$f; break ;; esac; done
+          test -n "$APK"
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          if [ -x "$BT/aapt" ]; then "$BT/aapt" dump badging "$APK" > badging.txt; else "$BT/aapt2" dump badging "$APK" > badging.txt; fi
+          grep -E "^(package|application-label|sdkVersion|targetSdkVersion|native-code):" badging.txt
+          grep -q "^package: name='com.emerald.legacy.custom' " badging.txt
+          grep -q "^application-label:'Emerald Custom'$" badging.txt
+          "$BT/apksigner" verify --verbose --print-certs "$APK" | tee signature.txt
+          VERSION=$(sed -n "s/^package: .* versionName='\([^']*\)'.*/\1/p" badging.txt)
+          test -n "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "apk=$PWD/$APK" >> "$GITHUB_OUTPUT"
+
+      - name: publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.check.outputs.version }}
+          APK: ${{ steps.check.outputs.apk }}
+        run: |
+          set -euo pipefail
+          SUM=$(sha256sum "$APK" | cut -d' ' -f1)
+          CERT=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$(dirname "$APK")/signature.txt")
+          if [ "$KEY_SOURCE" = secrets ]; then
+            TAG="v${VERSION}-build${GITHUB_RUN_NUMBER}"
+            OUT="$RUNNER_TEMP/Emerald-Custom-${VERSION}.apk"
+            TITLE="Emerald Custom ${VERSION} (build ${GITHUB_RUN_NUMBER})"
+            EXTRA=()
+            INTRO='Unofficial custom build of the LCE Emerald Launcher for Android.'
+          else
+            TAG="v${VERSION}-build${GITHUB_RUN_NUMBER}-intermediate"
+            OUT="$RUNNER_TEMP/Emerald-Custom-${VERSION}-intermediate.apk"
+            TITLE="Intermediate build ${GITHUB_RUN_NUMBER} - do not install"
+            EXTRA=(--prerelease)
+            INTRO='Signed with a throwaway key only, so it can be re-signed with the release key outside CI. Do not install this one; it is deleted once the re-signed APK has been delivered.'
+          fi
+          cp "$APK" "$OUT"
+          {
+            printf '%s\n\n' "$INTRO"
+            printf -- '- Package com.emerald.legacy.custom, label "Emerald Custom": installs next to the official app.\n'
+            printf -- '- Built from %s@%s and DiamondRuntime@%s with the patches in emerald-custom/.\n' "$LAUNCHER_REPO" "${LAUNCHER_COMMIT:0:7}" "${DIAMOND_COMMIT:0:7}"
+            printf -- '- APK SHA-256: %s\n' "$SUM"
+            printf -- '- Signing certificate SHA-256: %s\n' "$CERT"
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" "$OUT" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$TITLE" --notes-file "$RUNNER_TEMP/notes.md" "${EXTRA[@]}"
+
+  delete-intermediate:
+    if: ${{ inputs.delete_tag }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: delete the intermediate pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.delete_tag }}
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            v*-intermediate) ;;
+            *) echo "refusing to delete '$TAG': only tags ending in -intermediate"; exit 1 ;;
+          esac
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag

@@ -1,0 +1,47 @@
+diff --git a/src-tauri/gen/android/app/build.gradle.kts b/src-tauri/gen/android/app/build.gradle.kts
+index f44a4ea..6a0eb24 100644
+--- a/src-tauri/gen/android/app/build.gradle.kts
++++ b/src-tauri/gen/android/app/build.gradle.kts
+@@ -53,6 +53,10 @@ android {
+         }
+         getByName("release") {
+             signingConfig = signingConfigs.getByName("release")
++            // Installs next to the official app. Never use a suffix containing
++            // "wine" or "exe": ProcessHelper matches those words in /proc.
++            applicationIdSuffix = ".custom"
++            versionNameSuffix = "-custom"
+             isMinifyEnabled = true
+             proguardFiles(
+                 *fileTree(".") { include("**/*.pro") }
+diff --git a/src-tauri/gen/android/app/src/main/res/values/strings.xml b/src-tauri/gen/android/app/src/main/res/values/strings.xml
+index b14475e..bbcb46a 100644
+--- a/src-tauri/gen/android/app/src/main/res/values/strings.xml
++++ b/src-tauri/gen/android/app/src/main/res/values/strings.xml
+@@ -1,4 +1,4 @@
+ <resources>
+-    <string name="app_name">LCE Emerald Launcher</string>
+-    <string name="main_activity_title">LCE Emerald Launcher</string>
+-</resources>
+\ No newline at end of file
++    <string name="app_name">Emerald Custom</string>
++    <string name="main_activity_title">Emerald Custom</string>
++</resources>
+diff --git a/src/hooks/useGameManager.ts b/src/hooks/useGameManager.ts
+index 1a58bc4..966cf4b 100644
+--- a/src/hooks/useGameManager.ts
++++ b/src/hooks/useGameManager.ts
+@@ -87,12 +87,12 @@ export const BASE_EDITIONS = [
+     id: "360revived",
+     name: "360 Revived",
+     desc: "PC port of Xbox 360 Edition TU19",
+-    url: HIDDEN_INSTANCE_URL, //neo: was "https://github.com/BlackHoleSpirit/360-Revived/releases/download/nightly/360-Revived.zip"
++    url: "https://github.com/BlackHoleSpirit/360-Revived/releases/download/nightly/360-Revived.zip",
+     titleImage: "/images/minecraft_title_360revived.png",
+     supportsSlimSkins: false,
+     logo: "/images/360_revived.png",
+     panorama: "360revived",
+-    hideOnAndroid: true, //neo: [NOT EFFECT BECAUSE OF `url`] 360revived shows a black screen on Android
++    hideOnAndroid: false, // custom build: listed on Android too (upstream hid it after black screens)
+   },
+   {
+     id: "legacy_nether_fork",
